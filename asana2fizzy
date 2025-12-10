@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+#
+# asana2fizzy - Migrate Asana Tasks to Fizzy Cards
+#
+# Usage: asana2fizzy --project PROJECT_GID --board BOARD_ID [options]
+#
+# See asana2fizzy --help for full documentation.
+#
+
+set -euo pipefail
+
+# Load .env file if it exists (from script directory or current directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/.env"
+elif [[ -f ".env" ]]; then
+    # shellcheck source=/dev/null
+    source ".env"
+fi
+
+# Script version
+VERSION="1.0.0"
+
+# Asana API
+ASANA_API_BASE="https://app.asana.com/api/1.0"
+ASANA_TOKEN="${ASANA_TOKEN:-}"
+
+# Default values
+WORKSPACE_GID=""
+PROJECT_GID=""
+INCLUDE_COMPLETED=false
+LIMIT=100
+TASKS=()
+
+FIZZY_ACCOUNT_ID="${FIZZY_ACCOUNT:-}"
+BOARD_ID=""
+COLUMN_ID=""
+
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+COMPLETE_TASKS=false
+
+# Markdown converter
+MARKDOWN_CONVERTER=""
+
+# Counters for summary
+TOTAL_TASKS=0
+SUCCESS_COUNT=0
+FAIL_COUNT=0
+
+# Color output helpers (disabled if not a terminal)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+log_info() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${BLUE}[INFO]${NC} $*" >&2
+}
+
+log_success() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_verbose() {
+    [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+}
+
+die() {
+    log_error "$1"
+    exit "${2:-1}"
+}
+
+show_help() {
+    cat << 'EOF'
+asana2fizzy - Migrate Asana Tasks to Fizzy Cards
+
+USAGE:
+    asana2fizzy --project PROJECT_GID --board BOARD_ID [OPTIONS]
+
+REQUIRED:
+    --project, -p PROJECT_GID   Asana project GID to migrate from
+    --board BOARD_ID            Fizzy board ID to create cards in
+
+ASANA OPTIONS:
+    --workspace, -w GID         Asana workspace GID (auto-detected from project)
+    --completed                 Include completed tasks (default: only incomplete)
+    --limit N                   Maximum tasks to migrate (default: 100)
+    -t, --task GID              Specific task GID (can be repeated)
+
+FIZZY OPTIONS:
+    --account ACCOUNT_ID        Fizzy account ID (default: $FIZZY_ACCOUNT)
+    --column COLUMN_ID          Place cards in specific column (default: triage)
+
+BEHAVIOR:
+    --dry-run                   Preview without making changes
+    -v, --verbose               Show detailed output
+    -q, --quiet                 Suppress non-error output
+    --complete-tasks            Mark Asana tasks complete after migration
+
+OTHER:
+    -h, --help                  Show this help message
+    --version                   Show version
+
+ENVIRONMENT VARIABLES:
+    ASANA_TOKEN                 Asana Personal Access Token (required)
+    FIZZY_ACCOUNT               Fizzy account ID (optional)
+
+EXAMPLES:
+    # Migrate all incomplete tasks from a project
+    asana2fizzy -p 1234567890 --board fizzy_board_id
+
+    # Migrate specific tasks
+    asana2fizzy -p 1234567890 --board fizzy_board_id -t task_gid_1 -t task_gid_2
+
+    # Include completed tasks
+    asana2fizzy -p 1234567890 --board fizzy_board_id --completed
+
+    # Preview what would be migrated
+    asana2fizzy -p 1234567890 --board fizzy_board_id --dry-run
+
+    # Migrate and mark tasks complete in Asana
+    asana2fizzy -p 1234567890 --board fizzy_board_id --complete-tasks
+
+FINDING ASANA GIDs:
+    # List workspaces
+    curl -s "https://app.asana.com/api/1.0/workspaces" \
+      -H "Authorization: Bearer $ASANA_TOKEN" | jq '.data[] | {gid, name}'
+
+    # List projects in workspace
+    curl -s "https://app.asana.com/api/1.0/workspaces/WORKSPACE_GID/projects" \
+      -H "Authorization: Bearer $ASANA_TOKEN" | jq '.data[] | {gid, name}'
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                echo "asana2fizzy version $VERSION"
+                exit 0
+                ;;
+            -w|--workspace)
+                WORKSPACE_GID="$2"
+                shift 2
+                ;;
+            -p|--project)
+                PROJECT_GID="$2"
+                shift 2
+                ;;
+            --completed)
+                INCLUDE_COMPLETED=true
+                shift
+                ;;
+            --limit)
+                LIMIT="$2"
+                shift 2
+                ;;
+            -t|--task)
+                TASKS+=("$2")
+                shift 2
+                ;;
+            --account)
+                FIZZY_ACCOUNT_ID="$2"
+                shift 2
+                ;;
+            --board)
+                BOARD_ID="$2"
+                shift 2
+                ;;
+            --column)
+                COLUMN_ID="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            --complete-tasks)
+                COMPLETE_TASKS=true
+                shift
+                ;;
+            *)
+                die "Unknown argument: $1\nRun 'asana2fizzy --help' for usage." 2
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    if [[ -z "$PROJECT_GID" && ${#TASKS[@]} -eq 0 ]]; then
+        die "Missing required argument: --project PROJECT_GID or --task TASK_GID\nRun 'asana2fizzy --help' for usage." 2
+    fi
+
+    if [[ -z "$BOARD_ID" ]]; then
+        die "Missing required argument: --board BOARD_ID\nRun 'asana2fizzy --help' for usage." 2
+    fi
+
+    # Validate limit is a number
+    if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+        die "Invalid --limit value: $LIMIT. Must be a positive integer" 2
+    fi
+
+    log_verbose "Arguments validated"
+}
+
+check_dependencies() {
+    log_verbose "Checking dependencies..."
+
+    local missing=()
+
+    if ! command -v curl &>/dev/null; then
+        missing+=("curl")
+    fi
+
+    if ! command -v fizzy &>/dev/null; then
+        missing+=("fizzy (Fizzy CLI)")
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        missing+=("jq (JSON processor)")
+    fi
+
+    # Check for markdown converter (optional but recommended)
+    if command -v cmark &>/dev/null; then
+        MARKDOWN_CONVERTER="cmark"
+    elif command -v pandoc &>/dev/null; then
+        MARKDOWN_CONVERTER="pandoc"
+    else
+        log_warn "No markdown converter found (cmark or pandoc). Markdown will not be converted to HTML."
+        MARKDOWN_CONVERTER=""
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required tools:"
+        for tool in "${missing[@]}"; do
+            echo "  - $tool"
+        done
+        exit 3
+    fi
+
+    log_verbose "All dependencies found"
+}
+
+check_auth() {
+    log_verbose "Checking authentication..."
+
+    # Check Asana token
+    if [[ -z "$ASANA_TOKEN" ]]; then
+        die "ASANA_TOKEN environment variable not set. Get a token from https://app.asana.com/0/my-apps" 4
+    fi
+
+    # Test Asana API
+    local response
+    response=$(curl -s -w "\n%{http_code}" "https://app.asana.com/api/1.0/users/me" \
+        -H "Authorization: Bearer $ASANA_TOKEN" 2>/dev/null)
+    local http_code
+    http_code=$(echo "$response" | tail -1)
+
+    if [[ "$http_code" != "200" ]]; then
+        die "Asana authentication failed (HTTP $http_code). Check your ASANA_TOKEN." 4
+    fi
+
+    log_verbose "Asana authentication verified"
+
+    # Check Fizzy auth
+    if ! fizzy identity show --quiet &>/dev/null; then
+        die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
+    fi
+
+    log_verbose "Fizzy authentication verified"
+}
+
+# Make an Asana API request
+asana_api() {
+    local endpoint="$1"
+    local response
+
+    response=$(curl -s -w "\n%{http_code}" "${ASANA_API_BASE}${endpoint}" \
+        -H "Authorization: Bearer $ASANA_TOKEN" \
+        -H "Accept: application/json" 2>/dev/null)
+
+    local http_code
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" != "200" ]]; then
+        log_error "Asana API error (HTTP $http_code): $endpoint"
+        echo ""
+        return 1
+    fi
+
+    echo "$body"
+}
+
+fetch_tasks() {
+    log_info "Fetching tasks from Asana..."
+
+    local tasks_json
+
+    # If specific tasks requested, fetch them individually
+    if [[ ${#TASKS[@]} -gt 0 ]]; then
+        log_verbose "Fetching ${#TASKS[@]} specific task(s)..."
+        tasks_json="["
+        local first=true
+        for task_gid in "${TASKS[@]}"; do
+            local task_data
+            task_data=$(asana_api "/tasks/${task_gid}?opt_fields=gid,name,notes,html_notes,completed,tags.name,assignee.name,created_at")
+
+            if [[ -n "$task_data" ]]; then
+                local task
+                task=$(echo "$task_data" | jq '.data')
+                [[ "$first" == "false" ]] && tasks_json+=","
+                tasks_json+="$task"
+                first=false
+            else
+                log_warn "Task $task_gid not found, skipping"
+            fi
+        done
+        tasks_json+="]"
+    else
+        # Fetch from project
+        local completed_filter=""
+        if [[ "$INCLUDE_COMPLETED" != "true" ]]; then
+            completed_filter="&completed_since=now"
+        fi
+
+        local endpoint="/projects/${PROJECT_GID}/tasks?limit=${LIMIT}&opt_fields=gid,name,notes,html_notes,completed,tags.name,assignee.name,created_at${completed_filter}"
+        log_verbose "Fetching: $endpoint"
+
+        local response
+        response=$(asana_api "$endpoint")
+
+        if [[ -z "$response" ]]; then
+            die "Failed to fetch tasks from Asana"
+        fi
+
+        tasks_json=$(echo "$response" | jq '.data')
+    fi
+
+    echo "$tasks_json"
+}
+
+fetch_task_comments() {
+    local task_gid="$1"
+
+    log_verbose "Fetching comments for task $task_gid..."
+
+    local response
+    response=$(asana_api "/tasks/${task_gid}/stories?opt_fields=gid,type,text,html_text,created_by.name,created_at")
+
+    if [[ -z "$response" ]]; then
+        echo "[]"
+        return
+    fi
+
+    # Filter to only comments (not system events)
+    echo "$response" | jq '[.data[] | select(.type == "comment")]'
+}
+
+format_comments() {
+    local comments_json="$1"
+    local comment_count
+    comment_count=$(echo "$comments_json" | jq 'length')
+
+    if [[ "$comment_count" == "0" ]]; then
+        echo ""
+        return
+    fi
+
+    local formatted="**Migrated Comments from Asana**\n\n"
+
+    # Process each comment
+    local i=0
+    while [[ $i -lt $comment_count ]]; do
+        local author body created_at
+        author=$(echo "$comments_json" | jq -r ".[$i].created_by.name // \"Unknown\"")
+        body=$(echo "$comments_json" | jq -r ".[$i].text // \"\"")
+        created_at=$(echo "$comments_json" | jq -r ".[$i].created_at // \"\"")
+
+        # Format the date nicely
+        local formatted_date="$created_at"
+        if [[ -n "$created_at" ]]; then
+            formatted_date=$(date -d "$created_at" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created_at")
+        fi
+
+        formatted+="---\n"
+        formatted+="**${author}** commented on ${formatted_date}:\n\n"
+        formatted+="${body}\n\n"
+
+        i=$((i + 1))
+    done
+
+    echo -e "$formatted"
+}
+
+# Convert markdown to HTML if converter is available
+markdown_to_html() {
+    local markdown="$1"
+
+    if [[ -z "$MARKDOWN_CONVERTER" ]]; then
+        echo "$markdown"
+        return
+    fi
+
+    if [[ "$MARKDOWN_CONVERTER" == "cmark" ]]; then
+        echo "$markdown" | cmark --unsafe 2>/dev/null || echo "$markdown"
+    else
+        echo "$markdown" | pandoc -f gfm -t html 2>/dev/null || echo "$markdown"
+    fi
+}
+
+create_fizzy_card() {
+    local name="$1"
+    local notes="$2"
+    local tags_json="$3"
+    local task_gid="$4"
+
+    log_verbose "Creating card for task $task_gid: $name"
+
+    # Build fizzy options
+    local fizzy_opts=""
+    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+
+    # Fetch comments for this task
+    local comments_json
+    comments_json=$(fetch_task_comments "$task_gid")
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY-RUN] Would create card: $name"
+        log_verbose "[DRY-RUN] Notes length: ${#notes} chars"
+
+        # Show tags that would be applied
+        local tag_count
+        tag_count=$(echo "$tags_json" | jq 'length')
+        if [[ "$tag_count" -gt 0 ]]; then
+            local tag_names
+            tag_names=$(echo "$tags_json" | jq -r '.[].name' | tr '\n' ', ' | sed 's/,$//')
+            log_verbose "[DRY-RUN] Would apply tags: $tag_names"
+        fi
+
+        # Show comment count
+        local comment_count
+        comment_count=$(echo "$comments_json" | jq 'length')
+        if [[ "$comment_count" -gt 0 ]]; then
+            log_verbose "[DRY-RUN] Would add $comment_count migrated comment(s)"
+        fi
+
+        return 0
+    fi
+
+    # Convert notes to HTML
+    local html_notes
+    html_notes=$(markdown_to_html "$notes")
+
+    # Create temp file for description
+    local desc_file
+    desc_file=$(mktemp)
+    echo "$html_notes" > "$desc_file"
+
+    # Create the card
+    local response
+    response=$(fizzy card create \
+        $fizzy_opts \
+        --board "$BOARD_ID" \
+        --title "$name" \
+        --description_file "$desc_file" \
+        --format json 2>&1) || true
+
+    rm -f "$desc_file"
+
+    # Parse response
+    local success card_number
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null) || success="false"
+
+    if [[ "$success" != "true" ]]; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.error.message // "Unknown error"' 2>/dev/null) || error_msg="$response"
+        log_error "Failed to create card for task $task_gid: $error_msg"
+        return 1
+    fi
+
+    # Fetch card number (fizzy create doesn't return it)
+    local card_number
+    local cards_response
+    cards_response=$(fizzy card list --board "$BOARD_ID" $fizzy_opts --format json 2>/dev/null) || true
+    card_number=$(echo "$cards_response" | jq -r --arg title "$name" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
+
+    if [[ -z "$card_number" || "$card_number" == "null" ]]; then
+        log_success "Created card for task $task_gid (card number unavailable)"
+        log_warn "Unable to retrieve card number - skipping tags and comments"
+        return 0
+    fi
+
+    log_success "Created card #$card_number for task $task_gid"
+
+    # Move to column if specified
+    if [[ -n "$COLUMN_ID" ]]; then
+        log_verbose "Moving card #$card_number to column $COLUMN_ID"
+        fizzy card column "$card_number" --column "$COLUMN_ID" $fizzy_opts --quiet >/dev/null 2>&1 || \
+            log_warn "Failed to move card to column"
+    fi
+
+    # Apply tags
+    local tag_count
+    tag_count=$(echo "$tags_json" | jq 'length')
+    if [[ "$tag_count" -gt 0 ]]; then
+        log_verbose "Applying $tag_count tag(s)..."
+        local j=0
+        while [[ $j -lt $tag_count ]]; do
+            local tag_name
+            tag_name=$(echo "$tags_json" | jq -r ".[$j].name")
+            fizzy card tag "$card_number" --tag "$tag_name" $fizzy_opts --quiet >/dev/null 2>&1 || \
+                log_warn "Failed to apply tag: $tag_name"
+            j=$((j + 1))
+        done
+    fi
+
+    # Add migrated comments
+    local formatted_comments
+    formatted_comments=$(format_comments "$comments_json")
+    if [[ -n "$formatted_comments" ]]; then
+        log_verbose "Adding migrated comments to card #$card_number"
+
+        local comment_file html_comments
+        comment_file=$(mktemp)
+        html_comments=$(markdown_to_html "$formatted_comments")
+        echo "$html_comments" > "$comment_file"
+
+        fizzy comment create \
+            --card "$card_number" \
+            --body_file "$comment_file" \
+            $fizzy_opts --quiet >/dev/null 2>&1 || \
+            log_warn "Failed to add comments to card"
+
+        rm -f "$comment_file"
+    fi
+}
+
+post_migration_asana() {
+    local task_gid="$1"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        [[ "$COMPLETE_TASKS" == "true" ]] && log_info "[DRY-RUN] Would mark task $task_gid complete"
+        return 0
+    fi
+
+    if [[ "$COMPLETE_TASKS" == "true" ]]; then
+        log_verbose "Marking task $task_gid as complete in Asana..."
+
+        local response
+        response=$(curl -s -X PUT "${ASANA_API_BASE}/tasks/${task_gid}" \
+            -H "Authorization: Bearer $ASANA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"data": {"completed": true}}' 2>/dev/null)
+
+        local success
+        success=$(echo "$response" | jq -r '.data.completed // false')
+        if [[ "$success" != "true" ]]; then
+            log_warn "Failed to mark task $task_gid complete"
+        fi
+    fi
+}
+
+print_summary() {
+    echo ""
+    echo "============================================"
+    echo "Migration Summary"
+    echo "============================================"
+    echo "Total tasks processed: $TOTAL_TASKS"
+    echo "Successfully migrated: $SUCCESS_COUNT"
+    echo "Failed:                $FAIL_COUNT"
+    echo "============================================"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        echo "This was a DRY RUN - no changes were made."
+    fi
+}
+
+main() {
+    parse_args "$@"
+    validate_args
+    check_dependencies
+    check_auth
+
+    log_info "Starting Asana to Fizzy migration"
+    [[ "$DRY_RUN" == "true" ]] && log_warn "DRY RUN MODE - no changes will be made"
+
+    # Fetch tasks
+    local tasks_json
+    tasks_json=$(fetch_tasks)
+
+    TOTAL_TASKS=$(echo "$tasks_json" | jq 'length')
+
+    if [[ "$TOTAL_TASKS" == "0" ]]; then
+        log_warn "No tasks found matching the criteria"
+        exit 0
+    fi
+
+    log_info "Found $TOTAL_TASKS task(s) to migrate"
+
+    # Process each task
+    local i=0
+    while [[ $i -lt $TOTAL_TASKS ]]; do
+        local task
+        task=$(echo "$tasks_json" | jq ".[$i]")
+
+        local gid name notes tags_json
+        gid=$(echo "$task" | jq -r '.gid')
+        name=$(echo "$task" | jq -r '.name')
+        notes=$(echo "$task" | jq -r '.notes // ""')
+        tags_json=$(echo "$task" | jq '.tags // []')
+
+        log_info "Processing task $gid ($((i+1))/$TOTAL_TASKS): $name"
+
+        if create_fizzy_card "$name" "$notes" "$tags_json" "$gid"; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            post_migration_asana "$gid"
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+
+        i=$((i + 1))
+    done
+
+    print_summary
+
+    # Exit with partial failure code if any failed
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        exit 5
+    fi
+}
+
+# Run main with all arguments
+main "$@"
